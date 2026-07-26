@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""git-wtclone — create a git worktree with APFS clonefile(2) instead of a checkout.
+
+Instead of materialising every tracked file from the object database, clone an
+existing worktree's directory tree (one clonefile(2) per top-level entry, which
+the kernel recurses) and let git apply only the commit delta. Untracked and
+ignored files come along for free, and the clone shares blocks with the source
+so it costs almost no disk.
+
+Two ways to deal with the fact that cloned files have new inodes and ctimes,
+which git's index does not expect:
+
+  default   persist core.checkStat=minimal in the new worktree, so git compares
+            only whole-second mtime and size. Cheap, but a change that preserves
+            both (rsync -t, cp -p, tar -p) becomes invisible in that worktree.
+
+  --exact   rewrite the copied index's ctime/ino/dev/uid/gid fields from a fresh
+            lstat pass and recompute the trailing checksum. No config change and
+            no relaxation of git's checks; costs one pass over the index.
+
+Falls back to a plain `git worktree add` whenever the fast path does not apply.
+"""
+
+import argparse
+import ctypes
+import hashlib
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import time
+
+# clonefile(2) lives in libSystem; no compiled helper is needed. Threading it
+# does not help — the kernel already saturates the APFS metadata path from one
+# thread — so this stays deliberately serial.
+_libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+_libc.clonefile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32]
+_libc.clonefile.restype = ctypes.c_int
+
+# Past roughly half the tree changing, git's own checkout is faster than
+# clone-then-apply-the-delta, so hand back to it.
+DELTA_FALLBACK_RATIO = 0.5
+
+
+class Unsupported(Exception):
+    """The fast path does not apply; caller should fall back to git."""
+
+
+def clonefile(src, dst):
+    if _libc.clonefile(os.fsencode(src), os.fsencode(dst), 0) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), src, None, dst)
+
+
+def git(*args, cwd=None, capture=True, check=True):
+    r = subprocess.run(("git",) + args, cwd=cwd, check=check, text=True,
+                       stdout=subprocess.PIPE if capture else None,
+                       stderr=subprocess.PIPE if capture else None)
+    return r.stdout.strip() if capture else ""
+
+
+def git_ok(*args, cwd=None):
+    return subprocess.run(("git",) + args, cwd=cwd, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode == 0
+
+
+# --------------------------------------------------------------------------
+# index patching (--exact)
+# --------------------------------------------------------------------------
+
+def patch_index(index_path, worktree, hash_len):
+    """Refresh the stat fields git recorded for the *source* worktree so they
+    describe the clone instead.
+
+    Only ctime/dev/ino/uid/gid can differ: clonefile(2) preserves mtime to the
+    nanosecond, along with size and mode. Entry lengths never change, so the
+    TREE/EOIE/IEOT extensions and their offsets stay valid and only the trailing
+    checksum has to be recomputed.
+    """
+    data = bytearray(open(index_path, "rb").read())
+    if bytes(data[:4]) != b"DIRC":
+        raise Unsupported("not a DIRC index")
+    version, count = struct.unpack_from(">II", data, 4)
+    if version not in (2, 3):
+        # v4 prefix-compresses path names, so entries can't be walked this way.
+        raise Unsupported(f"index version {version} unsupported")
+
+    off, patched, missing = 12, 0, 0
+    for _ in range(count):
+        start = off
+        flags_off = start + 40 + hash_len
+        flags = struct.unpack_from(">H", data, flags_off)[0]
+        extended = bool(flags & 0x4000)
+        if extended and version < 3:
+            raise Unsupported("extended flag set in a v2 index")
+        name_off = flags_off + 2 + (2 if extended else 0)
+        namelen = flags & 0x0FFF
+        if namelen < 0x0FFF:
+            path_end = name_off + namelen
+        else:                                   # length didn't fit in 12 bits
+            path_end = data.index(b"\0", name_off)
+        path = bytes(data[name_off:path_end])
+
+        # entry is NUL-terminated then padded out to a multiple of 8 bytes
+        off = start + (((path_end + 1 - start) + 7) & ~7)
+
+        try:
+            st = os.lstat(os.path.join(worktree, os.fsdecode(path)))
+        except OSError:
+            missing += 1
+            continue
+
+        # git narrows every one of these to 32 bits when it records them
+        m = 0xFFFFFFFF
+        struct.pack_into(">II", data, start + 0,
+                         int(st.st_ctime) & m, st.st_ctime_ns % 1_000_000_000)
+        struct.pack_into(">II", data, start + 16, st.st_dev & m, st.st_ino & m)
+        struct.pack_into(">II", data, start + 28, st.st_uid & m, st.st_gid & m)
+        patched += 1
+
+    # A split index keeps its real entries elsewhere; patching this one is wrong.
+    tail = len(data) - hash_len
+    scan = off
+    while scan < tail:
+        sig = bytes(data[scan:scan + 4])
+        size = struct.unpack_from(">I", data, scan + 4)[0]
+        if sig == b"link":
+            raise Unsupported("split index (link extension)")
+        scan += 8 + size
+
+    algo = hashlib.sha1 if hash_len == 20 else hashlib.sha256
+    data[tail:] = algo(bytes(data[:tail])).digest()
+
+    tmp = index_path + ".wtclone"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, index_path)
+    return patched, missing
+
+
+# --------------------------------------------------------------------------
+# worktree construction
+# --------------------------------------------------------------------------
+
+def preflight(src_wt, dst, args):
+    """Raise Unsupported if the clone path can't be used safely."""
+    if sys.platform != "darwin":
+        raise Unsupported("not macOS")
+    if os.path.exists(dst):
+        raise Unsupported(f"{dst} already exists")
+
+    parent = os.path.dirname(os.path.abspath(dst)) or "."
+    if not os.path.isdir(parent):
+        raise Unsupported(f"{parent} does not exist")
+    if os.stat(parent).st_dev != os.stat(src_wt).st_dev:
+        raise Unsupported("destination is on a different volume")
+
+    if not args.dirty:
+        dirty = git("status", "--porcelain", "--untracked-files=no", cwd=src_wt)
+        if dirty:
+            raise Unsupported("source worktree has uncommitted changes "
+                              "(use --dirty to clone them too)")
+
+    if os.path.exists(os.path.join(src_wt, ".gitmodules")):
+        status = git("submodule", "status", cwd=src_wt, check=False)
+        # a leading '-' means "not initialised", which is harmless to clone
+        if any(l and not l.startswith("-") for l in status.splitlines()):
+            raise Unsupported("initialised submodules (their .git files point "
+                              "back at the source repo)")
+
+
+def resolve_checkout(args, path):
+    """Mirror `git worktree add`'s branch DWIM. Returns argv for git checkout."""
+    if args.b:
+        return ["checkout", "-b", args.b, args.commitish or "HEAD"]
+    if args.B:
+        return ["checkout", "-B", args.B, args.commitish or "HEAD"]
+    if args.detach:
+        return ["checkout", "--detach", args.commitish or "HEAD"]
+    if args.commitish:
+        # an existing branch is checked out; anything else detaches
+        return ["checkout", args.commitish]
+    return ["checkout", "-b", os.path.basename(os.path.abspath(path)), "HEAD"]
+
+
+def fallback_argv(args, path):
+    argv = ["worktree", "add"]
+    if args.b:
+        argv += ["-b", args.b]
+    if args.B:
+        argv += ["-B", args.B]
+    if args.detach:
+        argv += ["--detach"]
+    if args.force:
+        argv += ["--force"]
+    if args.quiet:
+        argv += ["-q"]
+    argv += [path]
+    if args.commitish:
+        argv += [args.commitish]
+    return argv
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="git wtclone",
+        description="Create a git worktree using APFS clonefile(2).")
+    p.add_argument("path")
+    p.add_argument("commitish", nargs="?")
+    p.add_argument("-b", metavar="BRANCH", help="create a new branch")
+    p.add_argument("-B", metavar="BRANCH", help="create or reset a branch")
+    p.add_argument("-d", "--detach", action="store_true", help="detach HEAD")
+    p.add_argument("-f", "--force", action="store_true")
+    p.add_argument("--from", dest="source", metavar="PATH",
+                   help="worktree to clone from (default: current)")
+    p.add_argument("--exact", action="store_true",
+                   help="patch the index instead of relaxing core.checkStat")
+    p.add_argument("--clean", action="store_true",
+                   help="drop untracked and ignored files after cloning")
+    p.add_argument("--dirty", action="store_true",
+                   help="allow cloning a source worktree with local changes")
+    p.add_argument("--no-clone", action="store_true",
+                   help="skip the fast path entirely")
+    p.add_argument("-q", "--quiet", action="store_true")
+    p.add_argument("-v", "--verbose", action="store_true", help="show timings")
+    args = p.parse_args()
+
+    def say(msg):
+        if not args.quiet:
+            print(msg, file=sys.stderr)
+
+    if not git_ok("rev-parse", "--git-dir"):
+        sys.exit("fatal: not a git repository")
+
+    dst = os.path.abspath(args.path)
+    timings = {}
+
+    def run_fallback(reason):
+        say(f"wtclone: {reason}; using git worktree add")
+        os.execvp("git", ["git"] + fallback_argv(args, args.path))
+
+    if args.no_clone:
+        run_fallback("--no-clone")
+
+    # Anything unexpected while working out what to clone (bare repo, no work
+    # tree, unresolvable ref) means git should handle this and report its own
+    # diagnostic rather than us surfacing a traceback.
+    try:
+        src_wt = (os.path.abspath(args.source) if args.source
+                  else git("rev-parse", "--show-toplevel"))
+        preflight(src_wt, dst, args)
+        src_head = git("rev-parse", "HEAD", cwd=src_wt)
+        requested = ((args.b and (args.commitish or "HEAD"))
+                     or args.commitish or "HEAD")
+        target = git("rev-parse", "--verify", "--quiet", requested + "^{commit}",
+                     cwd=src_wt, check=False)
+        if not target:
+            # let git worktree add produce the authoritative diagnostic
+            raise Unsupported(f"cannot resolve {requested!r}")
+
+        # Past ~half the tree changing, a plain checkout wins.
+        t = time.perf_counter()
+        changed = len(git("diff", "--name-only", src_head, target,
+                          cwd=src_wt).splitlines())
+        total = len(git("ls-files", cwd=src_wt).splitlines())
+        timings["delta_probe"] = time.perf_counter() - t
+        if total and changed / total > DELTA_FALLBACK_RATIO:
+            raise Unsupported(f"{changed} files differ (source tree has {total})")
+    except Unsupported as e:
+        run_fallback(str(e))
+    except (subprocess.CalledProcessError, OSError) as e:
+        run_fallback(f"cannot use fast path ({e.__class__.__name__})")
+
+    created = False
+    try:
+        t = time.perf_counter()
+        git("worktree", "add", "--no-checkout", "--detach", dst, src_head, cwd=src_wt)
+        created = True
+        timings["worktree_add"] = time.perf_counter() - t
+
+        t = time.perf_counter()
+        for name in os.listdir(src_wt):
+            if name != ".git":
+                clonefile(os.path.join(src_wt, name), os.path.join(dst, name))
+        timings["clone_tree"] = time.perf_counter() - t
+
+        admin = git("rev-parse", "--absolute-git-dir", cwd=dst)
+        src_admin = git("rev-parse", "--absolute-git-dir", cwd=src_wt)
+        t = time.perf_counter()
+        shutil.copyfile(os.path.join(src_admin, "index"), os.path.join(admin, "index"))
+        timings["copy_index"] = time.perf_counter() - t
+
+        checkout_cfg = []
+        if args.exact:
+            hash_len = 32 if git("rev-parse", "--show-object-format",
+                                 cwd=dst, check=False) == "sha256" else 20
+            t = time.perf_counter()
+            try:
+                n, missing = patch_index(os.path.join(admin, "index"), dst, hash_len)
+            except Unsupported as e:
+                shutil.copyfile(os.path.join(src_admin, "index"),
+                                os.path.join(admin, "index"))
+                raise Unsupported(f"--exact unavailable: {e}")
+            timings["patch_index"] = time.perf_counter() - t
+            if args.verbose:
+                say(f"wtclone: patched {n} index entries ({missing} missing)")
+        else:
+            if git("config", "--get", "extensions.worktreeConfig",
+                   cwd=src_wt, check=False) != "true":
+                # Enabling worktreeConfig makes these apply per-worktree, so git
+                # requires them relocated first. Note core.bare=false is written
+                # into every non-bare repo and is harmless — only true matters.
+                if git("config", "--local", "--get", "core.worktree",
+                       cwd=src_wt, check=False):
+                    raise Unsupported("core.worktree is set in shared config; "
+                                      "relocate it before enabling worktreeConfig")
+                if git("config", "--local", "--get", "core.bare",
+                       cwd=src_wt, check=False) == "true":
+                    raise Unsupported("core.bare is true in shared config; "
+                                      "relocate it before enabling worktreeConfig")
+                git("config", "extensions.worktreeConfig", "true", cwd=src_wt)
+            git("config", "--worktree", "core.checkStat", "minimal", cwd=dst)
+            checkout_cfg = ["-c", "core.checkStat=minimal"]
+
+        t = time.perf_counter()
+        argv = checkout_cfg + resolve_checkout(args, args.path)
+        if args.quiet:
+            argv.append("-q")
+        git(*argv, cwd=dst)
+        timings["delta_checkout"] = time.perf_counter() - t
+
+        if args.clean:
+            t = time.perf_counter()
+            git("clean", "-xdff", cwd=dst)
+            timings["clean"] = time.perf_counter() - t
+
+    except BaseException as e:
+        if created:
+            git("worktree", "remove", "--force", dst, cwd=src_wt, check=False)
+            shutil.rmtree(dst, ignore_errors=True)
+            git("worktree", "prune", cwd=src_wt, check=False)
+        if isinstance(e, Unsupported):
+            run_fallback(str(e))
+        if isinstance(e, (subprocess.CalledProcessError, OSError)):
+            run_fallback(f"fast path failed ({e.__class__.__name__})")
+        raise
+
+    head = git("rev-parse", "--short", "HEAD", cwd=dst)
+    mode = "exact" if args.exact else "checkStat=minimal"
+    say(f"wtclone: {dst} at {head} ({changed} files applied, {mode})")
+    if args.verbose:
+        for k, v in timings.items():
+            say(f"  {k:<15} {v:.3f}s")
+        say(f"  {'TOTAL':<15} {sum(timings.values()):.3f}s")
+
+
+if __name__ == "__main__":
+    main()

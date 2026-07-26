@@ -1,0 +1,8 @@
+# benchmark output
+*.log
+
+# benchmark scratch worktrees (.noindex keeps Spotlight out)
+*.noindex/
+
+__pycache__/
+*.pyc
