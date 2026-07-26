@@ -14,8 +14,13 @@ back to `git worktree add` everywhere else.
 
 ```sh
 cp git-wtclone /usr/local/bin/     # anywhere on PATH
-git wtclone --help
+git-wtclone --help
 ```
+
+Requires **git 2.29+** — `rev-parse --show-object-format` is the newest thing
+used (`config --worktree` needs 2.20, `rev-parse --absolute-git-dir` 2.13).
+Older git falls back to `git worktree add`, so nothing breaks; you just lose the
+speedup. Also needs Python 3.8+, macOS, and APFS.
 
 ## Usage
 
@@ -105,12 +110,22 @@ Supporting measurements:
 
 ## Falls back to `git worktree add` when
 
-Not macOS · destination on a different volume · destination exists · parent
-missing · source worktree has uncommitted changes (`--dirty` to override) ·
-initialised submodules (their `.git` files hold absolute paths into the source
-repo) · delta exceeds 50% of the tree · unresolvable commit-ish · index is v4 or
-a split index (default mode only) · `core.worktree` set or `core.bare` true
-in shared config (`--no-patch` only) · `--no-clone`.
+Not macOS · git older than 2.29 · destination on a different volume ·
+destination exists · parent missing · source worktree has uncommitted changes
+(`--dirty` to override) · initialised submodules (their `.git` files hold
+absolute paths into the source repo) · delta exceeds 50% of the tree ·
+unresolvable commit-ish · `core.worktree` set or `core.bare` true in shared
+config (`--no-patch` only) · `--no-clone`.
+
+Default mode additionally hands back whenever the index is anything it cannot
+rewrite with certainty: version 4 (prefix-compressed paths), a split index, an
+`FSMN` extension (its token describes the *source* worktree), a sparse index
+with directory entries, an `EOIE` extension disagreeing with where the entry
+walk ended, an extension table not landing exactly on the trailer, or more than
+2% of tracked files missing from the clone. After patching, git has to read the
+index back with the same entry count or the original is restored. It never
+degrades to `--no-patch` on its own — that would relax `core.checkStat` without
+being asked.
 
 The tool never reports an error itself. It cleans up any partial worktree and
 hands off to git so git emits the authoritative diagnostic.
@@ -164,6 +179,7 @@ install. `bench/` holds the investigation that produced it:
 | `probe_design.py`, `probe_stat.py` | index repair and time-to-usable design probes |
 | `probe_checkstat*.py`, `probe_ctime.py` | what `core.checkStat=minimal` stops checking |
 | `clonelib.py` | shared `clonefile(2)` ctypes helper |
+| `test_patch_index.py` | regression tests for the index patcher |
 
 `contrib/claude-skill.md` is the Claude Code skill described above.
 

@@ -26,6 +26,7 @@ import argparse
 import ctypes
 import hashlib
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -42,6 +43,17 @@ _libc.clonefile.restype = ctypes.c_int
 # Past roughly half the tree changing, git's own checkout is faster than
 # clone-then-apply-the-delta, so hand back to it.
 DELTA_FALLBACK_RATIO = 0.5
+
+# `git rev-parse --show-object-format` (2.29) is the newest thing used here;
+# `git config --worktree` (2.20) and `--absolute-git-dir` (2.13) came earlier.
+MIN_GIT = (2, 29)
+
+# If this many tracked files are absent from the clone, something went wrong
+# and a mostly-stale index is not worth writing.
+MAX_MISSING_RATIO = 0.02
+
+S_IFMT, S_IFDIR, S_IFREG, S_IFLNK, S_IFGITLINK = (
+    0o170000, 0o040000, 0o100000, 0o120000, 0o160000)
 
 
 class Unsupported(Exception):
@@ -66,45 +78,91 @@ def git_ok(*args, cwd=None):
                           stderr=subprocess.DEVNULL).returncode == 0
 
 
+def git_version():
+    m = re.search(r"(\d+)\.(\d+)", git("--version", check=False))
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+
+
 # --------------------------------------------------------------------------
 # index patching (default; disabled by --no-patch)
 # --------------------------------------------------------------------------
 
 def patch_index(index_path, worktree, hash_len):
     """Refresh the stat fields git recorded for the *source* worktree so they
-    describe the clone instead.
+    describe the clone instead. Returns (total, patched, missing, skipped).
 
     Only ctime/dev/ino/uid/gid can differ: clonefile(2) preserves mtime to the
-    nanosecond, along with size and mode. Entry lengths never change, so the
-    TREE/EOIE/IEOT extensions and their offsets stay valid and only the trailing
-    checksum has to be recomputed.
+    nanosecond, along with size and mode.
+
+    mtime and size are deliberately NOT touched, and must stay that way. They
+    are the fields that carry content identity: under --dirty a modified file
+    keeps the stale mtime the index recorded while it was clean, which is what
+    still lets git see it as modified. "Helpfully" refreshing mtime here would
+    mark every uncommitted change in the new worktree clean, and the next
+    checkout would silently discard it.
+
+    Entry lengths never change, so the TREE/EOIE/IEOT extensions and their
+    offsets stay valid and only the trailing checksum is recomputed.
     """
+    try:
+        return _patch_index(index_path, worktree, hash_len)
+    except Unsupported:
+        raise
+    except (struct.error, ValueError, IndexError) as e:
+        # A malformed index must degrade to a fallback, never a traceback.
+        raise Unsupported(f"malformed index ({type(e).__name__}: {e})")
+
+
+def _patch_index(index_path, worktree, hash_len):
     data = bytearray(open(index_path, "rb").read())
-    if bytes(data[:4]) != b"DIRC":
+    if len(data) < 12 + hash_len or bytes(data[:4]) != b"DIRC":
         raise Unsupported("not a DIRC index")
     version, count = struct.unpack_from(">II", data, 4)
     if version not in (2, 3):
         # v4 prefix-compresses path names, so entries can't be walked this way.
         raise Unsupported(f"index version {version} unsupported")
 
-    off, patched, missing = 12, 0, 0
-    for _ in range(count):
+    tail = len(data) - hash_len          # first byte of the trailing checksum
+    fixed = 40 + hash_len + 2            # stat block + object name + flags
+    off, patched, missing, skipped = 12, 0, 0, 0
+
+    for i in range(count):
         start = off
-        flags_off = start + 40 + hash_len
-        flags = struct.unpack_from(">H", data, flags_off)[0]
+        if start + fixed > tail:
+            raise Unsupported(f"entry {i} runs past the end of the index")
+        flags = struct.unpack_from(">H", data, start + 40 + hash_len)[0]
         extended = bool(flags & 0x4000)
         if extended and version < 3:
             raise Unsupported("extended flag set in a v2 index")
-        name_off = flags_off + 2 + (2 if extended else 0)
+        name_off = start + fixed + (2 if extended else 0)
+
         namelen = flags & 0x0FFF
         if namelen < 0x0FFF:
             path_end = name_off + namelen
         else:                                   # length didn't fit in 12 bits
-            path_end = data.index(b"\0", name_off)
+            path_end = data.find(b"\0", name_off, tail)
+            if path_end < 0:
+                raise Unsupported(f"entry {i} has an unterminated path")
+        if path_end >= tail:
+            raise Unsupported(f"entry {i} path runs past the end of the index")
         path = bytes(data[name_off:path_end])
 
         # entry is NUL-terminated then padded out to a multiple of 8 bytes
         off = start + (((path_end + 1 - start) + 7) & ~7)
+        if off > tail:
+            raise Unsupported(f"entry {i} padding runs past the end of the index")
+
+        kind = struct.unpack_from(">I", data, start + 24)[0] & S_IFMT
+        if kind == S_IFDIR:
+            # A sparse index stores directory entries; those are not files we
+            # can stat meaningfully, and ls-files no longer maps 1:1 to entries.
+            raise Unsupported("sparse index (directory entries)")
+        if kind not in (S_IFREG, S_IFLNK):
+            skipped += 1                        # gitlink, or something exotic
+            continue
+        if extended and struct.unpack_from(">H", data, start + fixed)[0] & 0x4000:
+            skipped += 1                        # skip-worktree: absent by design
+            continue
 
         try:
             st = os.lstat(os.path.join(worktree, os.fsdecode(path)))
@@ -120,24 +178,58 @@ def patch_index(index_path, worktree, hash_len):
         struct.pack_into(">II", data, start + 28, st.st_uid & m, st.st_gid & m)
         patched += 1
 
-    # A split index keeps its real entries elsewhere; patching this one is wrong.
-    tail = len(data) - hash_len
-    scan = off
+    considered = patched + missing
+    if considered and missing / considered > MAX_MISSING_RATIO:
+        raise Unsupported(f"{missing} of {considered} tracked files are missing "
+                          f"from the clone")
+
+    # Walk the extensions. This must land exactly on the trailer: if it does
+    # not, the entry walk above desynced and the bytes just patched were not
+    # the ones intended.
+    entries_end, scan = off, off
     while scan < tail:
+        if scan + 8 > tail:
+            raise Unsupported("truncated extension header")
         sig = bytes(data[scan:scan + 4])
         size = struct.unpack_from(">I", data, scan + 4)[0]
+        if not (sig.isascii() and sig.isalpha()):
+            raise Unsupported(f"implausible extension signature {sig!r} "
+                              f"— the entry table did not parse as expected")
+        body = scan + 8
+        if body + size > tail:
+            raise Unsupported(f"extension {sig.decode()} runs past the end "
+                              f"of the index")
         if sig == b"link":
+            # A split index keeps its real entries elsewhere.
             raise Unsupported("split index (link extension)")
-        scan += 8 + size
+        if sig == b"FSMN":
+            # The token and clean-bitmap describe the *source* worktree.
+            raise Unsupported("fsmonitor extension present")
+        if sig == b"EOIE" and size >= 4:
+            # EOIE records where the entries end — an authoritative cross-check.
+            recorded = struct.unpack_from(">I", data, body)[0]
+            if recorded != entries_end:
+                raise Unsupported(f"EOIE says entries end at {recorded}, "
+                                  f"walk ended at {entries_end}")
+        scan = body + size
+    if scan != tail:
+        raise Unsupported("extension table does not end at the trailer")
 
     algo = hashlib.sha1 if hash_len == 20 else hashlib.sha256
     data[tail:] = algo(bytes(data[:tail])).digest()
 
     tmp = index_path + ".wtclone"
-    with open(tmp, "wb") as f:
-        f.write(data)
-    os.replace(tmp, index_path)
-    return patched, missing
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, index_path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    return count, patched, missing, skipped
 
 
 # --------------------------------------------------------------------------
@@ -244,6 +336,10 @@ def main():
 
     if args.no_clone:
         run_fallback("--no-clone")
+    have = git_version()
+    if have < MIN_GIT:
+        run_fallback(f"git {have[0]}.{have[1]} is older than "
+                     f"{MIN_GIT[0]}.{MIN_GIT[1]}")
 
     # Anything unexpected while working out what to clone (bare repo, no work
     # tree, unresolvable ref) means git should handle this and report its own
@@ -295,21 +391,32 @@ def main():
 
         checkout_cfg = []
         if not args.no_patch:
-            hash_len = 32 if git("rev-parse", "--show-object-format",
-                                 cwd=dst, check=False) == "sha256" else 20
+            fmt = git("rev-parse", "--show-object-format", cwd=dst, check=False)
+            if fmt not in ("sha1", "sha256"):
+                raise Unsupported("cannot determine the repository object format")
+            hash_len = 32 if fmt == "sha256" else 20
+
+            index = os.path.join(admin, "index")
             t = time.perf_counter()
             try:
-                n, missing = patch_index(os.path.join(admin, "index"), dst, hash_len)
+                total_e, n, missing, skipped = patch_index(index, dst, hash_len)
+                # Make git re-read what we wrote. This is the net under every
+                # assumption above about the on-disk format: if the index no
+                # longer parses, or no longer describes the same number of
+                # entries, the patch was wrong regardless of why.
+                listed = git("ls-files", cwd=dst, check=False)
+                if len(listed.splitlines()) != total_e:
+                    raise Unsupported("patched index failed to read back")
             except Unsupported as e:
-                shutil.copyfile(os.path.join(src_admin, "index"),
-                                os.path.join(admin, "index"))
+                shutil.copyfile(os.path.join(src_admin, "index"), index)
                 # Deliberately not degrading to --no-patch here: that would
                 # silently relax core.checkStat the caller did not ask for.
                 raise Unsupported(f"cannot patch index ({e}) — "
                                   f"pass --no-patch to take the fast path anyway")
             timings["patch_index"] = time.perf_counter() - t
             if args.verbose:
-                say(f"wtclone: patched {n} index entries ({missing} missing)")
+                say(f"wtclone: patched {n}/{total_e} index entries "
+                    f"({missing} missing, {skipped} skipped)")
         else:
             if git("config", "--get", "extensions.worktreeConfig",
                    cwd=src_wt, check=False) != "true":
