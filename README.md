@@ -24,7 +24,7 @@ git wtclone ../feature-x                  # new branch "feature-x" off HEAD
 git wtclone ../hotfix main                # check out an existing branch
 git wtclone -b exp ../exp origin/main     # new branch from a start point
 git wtclone --detach ../poke HEAD~5
-git wtclone --exact ../feature-x          # no config change (see below)
+git wtclone --no-patch ../feature-x       # leave .git untouched (see below)
 git wtclone --clean ../feature-x          # tracked files only
 git wtclone -v ../feature-x               # per-step timings
 ```
@@ -40,15 +40,22 @@ Cloned files get new inodes and ctimes, which the copied index doesn't expect.
 Left alone, the first git command that refreshes the index re-hashes all of it —
 on the rust repo that's a 4-second penalty wipes out the savings.
 
-By default wtclone persists `core.checkStat=minimal` into the new worktree (per-worktree
-via `extensions.worktreeConfig`, so other worktrees keep git's default). Git then
-compares only whole-second mtime and size.
+By default wtclone patches the new worktree's index: it rewrites each entry's
+ctime/dev/ino/uid/gid from a fresh `lstat` pass and recomputes the trailing
+checksum. Nothing else can differ, because `clonefile(2)` preserves mtime to the
+nanosecond along with size and mode. Git's checking stays exactly as it was and
+no config changes.
 
-Passing `--exact` rewrites the copied index's ctime/dev/ino/uid/gid from a fresh
-`lstat` pass and recomputes the trailing checksum. No config change, no relaxed
-checking. Costs ~0.2s more.
+`--no-patch` leaves `.git` alone. Instead it persists `core.checkStat=minimal`
+into the new worktree (per-worktree via `extensions.worktreeConfig`, so other
+worktrees keep git's default), which makes git compare only whole-second mtime
+and size. About 0.2s faster, at the cost described below.
 
-### Downside of `core.checkStat=minimal`
+Use `--no-patch` if you'd rather the tool not rewrite index bytes at all. The
+default is otherwise the better choice — it's the one that preserves stock
+semantics.
+
+### Downside of `--no-patch` (`core.checkStat=minimal`)
 
 It stops comparing ctime, inode, uid/gid, and sub-second mtime. Any change that
 preserves **whole-second mtime and size** becomes invisible in that worktree —
@@ -74,12 +81,12 @@ objects, 1.4 GB total. M5 Max, APFS, git 2.50.1.
 Time-to-usable = create + first `git status`. Median of 3, every result verified
 against a reference checkout by SHA-256 content manifest.
 
-| changed files | `git worktree add` | `wtclone` | `wtclone --exact` |
-|--------------:|-------------------:|----------:|------------------:|
-| 0             | 3.87 s / 432 MB    | **1.24 s / 23 MB** | 1.40 s / 25 MB |
-| 946           | 3.65 s / 432 MB    | **1.43 s / 43 MB** | 1.63 s / 43 MB |
-| 9,669         | 3.65 s / 424 MB    | **2.48 s / 147 MB** | 2.77 s / 152 MB |
-| 23,517        | 3.68 s / 397 MB    | **3.28 s / 203 MB** | 3.47 s / 202 MB |
+| changed files | `git worktree add` | `wtclone` | `wtclone --no-patch` |
+|--------------:|-------------------:|----------:|---------------------:|
+| 0             | 3.87 s / 432 MB    | **1.40 s / 25 MB**  | 1.24 s / 23 MB |
+| 946           | 3.65 s / 432 MB    | **1.63 s / 43 MB**  | 1.43 s / 43 MB |
+| 9,669         | 3.65 s / 424 MB    | **2.77 s / 152 MB** | 2.48 s / 147 MB |
+| 23,517        | 3.68 s / 397 MB    | **3.47 s / 202 MB** | 3.28 s / 203 MB |
 
 Measured crossover is ~32,000 changed files (~50% of the tree); past that a plain
 checkout is faster and wtclone falls back automatically.
@@ -102,8 +109,8 @@ Not macOS · destination on a different volume · destination exists · parent
 missing · source worktree has uncommitted changes (`--dirty` to override) ·
 initialised submodules (their `.git` files hold absolute paths into the source
 repo) · delta exceeds 50% of the tree · unresolvable commit-ish · index is v4 or
-a split index (`--exact` only) · `core.worktree` set or `core.bare` true in
-shared config (default mode only) · `--no-clone`.
+a split index (default mode only) · `core.worktree` set or `core.bare` true
+in shared config (`--no-patch` only) · `--no-clone`.
 
 The tool never reports an error itself. It cleans up any partial worktree and
 hands off to git so git emits the authoritative diagnostic.
@@ -120,7 +127,8 @@ projects) or a project's `CLAUDE.md`:
 Prefer `git wtclone` over `git worktree add`. It takes the same arguments, is
 ~3x faster on APFS, and carries untracked build artifacts (`target/`,
 `node_modules/`) into the new worktree so it doesn't need a full rebuild.
-Prefer `--exact`, which avoids relaxing `core.checkStat`.
+Use the default mode — `--no-patch` trades stock `core.checkStat` semantics
+for ~0.2s and is rarely worth it.
 
 It validates its own preconditions and falls back to `git worktree add`
 automatically when they don't hold, so it is never wrong to try. Other

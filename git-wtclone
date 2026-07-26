@@ -10,13 +10,14 @@ so it costs almost no disk.
 Two ways to deal with the fact that cloned files have new inodes and ctimes,
 which git's index does not expect:
 
-  default   persist core.checkStat=minimal in the new worktree, so git compares
-            only whole-second mtime and size. Cheap, but a change that preserves
-            both (rsync -t, cp -p, tar -p) becomes invisible in that worktree.
+  default     rewrite the copied index's ctime/ino/dev/uid/gid fields from a
+              fresh lstat pass and recompute the trailing checksum. Keeps stock
+              git semantics and changes no config; costs one pass over the index.
 
-  --exact   rewrite the copied index's ctime/ino/dev/uid/gid fields from a fresh
-            lstat pass and recompute the trailing checksum. No config change and
-            no relaxation of git's checks; costs one pass over the index.
+  --no-patch  leave .git untouched and persist core.checkStat=minimal in the new
+              worktree instead, so git compares only whole-second mtime and size.
+              Marginally faster, but a change preserving both (rsync -t, cp -p,
+              tar -p) becomes invisible in that worktree.
 
 Falls back to a plain `git worktree add` whenever the fast path does not apply.
 """
@@ -66,7 +67,7 @@ def git_ok(*args, cwd=None):
 
 
 # --------------------------------------------------------------------------
-# index patching (--exact)
+# index patching (default; disabled by --no-patch)
 # --------------------------------------------------------------------------
 
 def patch_index(index_path, worktree, hash_len):
@@ -214,8 +215,9 @@ def main():
     p.add_argument("-f", "--force", action="store_true")
     p.add_argument("--from", dest="source", metavar="PATH",
                    help="worktree to clone from (default: current)")
-    p.add_argument("--exact", action="store_true",
-                   help="patch the index instead of relaxing core.checkStat")
+    p.add_argument("--no-patch", dest="no_patch", action="store_true",
+                   help="leave .git untouched; persist core.checkStat=minimal "
+                        "in the new worktree instead of rewriting its index")
     p.add_argument("--clean", action="store_true",
                    help="drop untracked and ignored files after cloning")
     p.add_argument("--dirty", action="store_true",
@@ -292,7 +294,7 @@ def main():
         timings["copy_index"] = time.perf_counter() - t
 
         checkout_cfg = []
-        if args.exact:
+        if not args.no_patch:
             hash_len = 32 if git("rev-parse", "--show-object-format",
                                  cwd=dst, check=False) == "sha256" else 20
             t = time.perf_counter()
@@ -301,7 +303,10 @@ def main():
             except Unsupported as e:
                 shutil.copyfile(os.path.join(src_admin, "index"),
                                 os.path.join(admin, "index"))
-                raise Unsupported(f"--exact unavailable: {e}")
+                # Deliberately not degrading to --no-patch here: that would
+                # silently relax core.checkStat the caller did not ask for.
+                raise Unsupported(f"cannot patch index ({e}) — "
+                                  f"pass --no-patch to take the fast path anyway")
             timings["patch_index"] = time.perf_counter() - t
             if args.verbose:
                 say(f"wtclone: patched {n} index entries ({missing} missing)")
@@ -347,7 +352,7 @@ def main():
         raise
 
     head = git("rev-parse", "--short", "HEAD", cwd=dst)
-    mode = "exact" if args.exact else "checkStat=minimal"
+    mode = "checkStat=minimal" if args.no_patch else "index patched"
     say(f"wtclone: {dst} at {head} ({changed} files applied, {mode})")
     if args.verbose:
         for k, v in timings.items():

@@ -39,9 +39,9 @@ def manifest(root):
     return h.hexdigest(), n
 
 VARIANTS = {
-    "git worktree add": lambda d, t: sh("git", "-C", SRC, "worktree", "add", "-q", "--detach", d, t),
-    "wtclone":          lambda d, t: sh(WTC, "-q", "--detach", d, t, cwd=SRC),
-    "wtclone --exact":  lambda d, t: sh(WTC, "-q", "--exact", "--detach", d, t, cwd=SRC),
+    "git worktree add":   lambda d, t: sh("git", "-C", SRC, "worktree", "add", "-q", "--detach", d, t),
+    "wtclone":            lambda d, t: sh(WTC, "-q", "--detach", d, t, cwd=SRC),
+    "wtclone --no-patch": lambda d, t: sh(WTC, "-q", "--no-patch", "--detach", d, t, cwd=SRC),
 }
 
 os.makedirs(BENCH, exist_ok=True)

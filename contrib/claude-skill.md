@@ -40,16 +40,17 @@ So a failed precondition costs nothing and still produces a correct worktree.
 
 Cloned files get new inodes and ctimes that the copied index does not expect.
 
-- **Default** persists `core.checkStat=minimal` in the new worktree. Git then
-  compares only whole-second mtime and size, so a change preserving both
-  (`rsync -t`, `cp -p`, `tar -p`, cache restore) becomes invisible *in that
-  worktree* — `git checkout` will silently overwrite it.
-- **`--exact`** patches the index's stat fields instead. No config change, no
-  relaxed checking, stock git semantics, ~0.2s slower.
+- **Default** patches the new worktree's index so its stat fields describe the
+  clone. No config change, no relaxed checking, stock git semantics.
+- **`--no-patch`** leaves `.git` untouched and persists `core.checkStat=minimal`
+  instead, so git compares only whole-second mtime and size. ~0.2s faster, but a
+  change preserving both (`rsync -t`, `cp -p`, `tar -p`, cache restore) becomes
+  invisible *in that worktree* — `git checkout` will silently overwrite it.
 
-**Prefer `--exact`** unless creation latency genuinely matters. It gives up
-nothing. Definitely use it if the worktree will be a target of `rsync`, archive
-extraction, or CI cache restoration.
+**Use the default.** Only pass `--no-patch` if the caller has said they don't
+want the index rewritten; never reach for it just to save the 0.2s, and never
+for a worktree that will be a target of `rsync`, archive extraction, or CI cache
+restoration.
 
 ## Carrying build artifacts
 
