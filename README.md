@@ -108,6 +108,40 @@ shared config (default mode only) · `--no-clone`.
 The tool never reports an error itself. It cleans up any partial worktree and
 hands off to git so git emits the authoritative diagnostic.
 
+## Making it the default for Claude Code
+
+Coding agents reach for `git worktree add` reflexively, so the substitution has
+to be stated somewhere always in context. Add this to `~/.claude/CLAUDE.md` (all
+projects) or a project's `CLAUDE.md`:
+
+```markdown
+## Git worktrees on macOS
+
+Prefer `git wtclone` over `git worktree add`. It takes the same arguments, is
+~3x faster on APFS, and carries untracked build artifacts (`target/`,
+`node_modules/`) into the new worktree so it doesn't need a full rebuild.
+Prefer `--exact`, which avoids relaxing `core.checkStat`.
+
+It validates its own preconditions and falls back to `git worktree add`
+automatically when they don't hold, so it is never wrong to try. Other
+subcommands (`list`, `remove`, `prune`, …) still go through `git worktree`.
+```
+
+That last paragraph is the part that matters: an agent will not adopt an
+unfamiliar command if it thinks a wrong guess costs a broken worktree.
+
+For the fuller version — mode selection, the `core.checkStat` tradeoff, what to
+do when the tool isn't installed — install [`contrib/claude-skill.md`](contrib/claude-skill.md)
+as a skill:
+
+```sh
+mkdir -p ~/.claude/skills/git-worktree
+cp contrib/claude-skill.md ~/.claude/skills/git-worktree/SKILL.md
+```
+
+A skill loads on demand rather than staying in context, so it complements the
+`CLAUDE.md` rule instead of replacing it. Use both.
+
 ## Layout
 
 `git-wtclone` is the tool — a single file, and the only thing you need to
@@ -122,6 +156,8 @@ install. `bench/` holds the investigation that produced it:
 | `probe_design.py`, `probe_stat.py` | index repair and time-to-usable design probes |
 | `probe_checkstat*.py`, `probe_ctime.py` | what `core.checkStat=minimal` stops checking |
 | `clonelib.py` | shared `clonefile(2)` ctypes helper |
+
+`contrib/claude-skill.md` is the Claude Code skill described above.
 
 To reproduce, point `WTCLONE_BENCH_REPO` at a large checkout — it defaults to
 `~/git/rust` — and run any script in `bench/`:
