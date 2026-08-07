@@ -19,6 +19,11 @@ which git's index does not expect:
               Marginally faster, but a change preserving both (rsync -t, cp -p,
               tar -p) becomes invisible in that worktree.
 
+--exclude and --exclude-ignored leave things behind by not cloning them: a
+directory holding an excluded *directory* is recreated and its keepers cloned
+individually, so the excluded bytes are never paid for. Excluded *files* are
+cheaper to clone and unlink than to sidestep, so those come off afterwards.
+
 Falls back to a plain `git worktree add` whenever the fast path does not apply.
 """
 
@@ -55,13 +60,22 @@ MAX_MISSING_RATIO = 0.02
 S_IFMT, S_IFDIR, S_IFREG, S_IFLNK, S_IFGITLINK = (
     0o170000, 0o040000, 0o100000, 0o120000, 0o160000)
 
+# Without CLONE_NOFOLLOW clonefile(2) follows a symlink given as the source: the
+# clone becomes a regular file holding the target's bytes (git sees a typechange)
+# and a dangling link fails with ENOENT outright. It is documented as applying
+# only when the source is not a directory, so passing it always is safe.
+CLONE_NOFOLLOW = 0x0001
+
+# What a prune tree maps a name to when nothing about it is excluded.
+KEEP = object()
+
 
 class Unsupported(Exception):
     """The fast path does not apply; caller should fall back to git."""
 
 
 def clonefile(src, dst):
-    if _libc.clonefile(os.fsencode(src), os.fsencode(dst), 0) != 0:
+    if _libc.clonefile(os.fsencode(src), os.fsencode(dst), CLONE_NOFOLLOW) != 0:
         err = ctypes.get_errno()
         raise OSError(err, os.strerror(err), src, None, dst)
 
@@ -76,6 +90,11 @@ def git(*args, cwd=None, capture=True, check=True):
 def git_ok(*args, cwd=None):
     return subprocess.run(("git",) + args, cwd=cwd, stdout=subprocess.DEVNULL,
                           stderr=subprocess.DEVNULL).returncode == 0
+
+
+def nul_list(out):
+    """Split the -z output of a git command into paths."""
+    return [p for p in out.split("\0") if p]
 
 
 def git_version():
@@ -233,6 +252,161 @@ def _patch_index(index_path, worktree, hash_len):
 
 
 # --------------------------------------------------------------------------
+# exclusions
+# --------------------------------------------------------------------------
+
+def parse_excludes(values):
+    """Normalise --exclude values (comma-separated, repeatable) to relative paths.
+
+    Literal paths only, deliberately no patterns. Routing them through git
+    pathspecs would have given globs for free but is quietly wrong: git collapses
+    a wholly-untracked directory to the directory itself, so `*/node_modules`
+    matches nothing under one. A path that means what it says is worth more here.
+    """
+    out = []
+    for raw in values or []:
+        for item in raw.split(","):
+            path = item.strip().rstrip("/")
+            if not path:
+                continue
+            norm = os.path.normpath(path)
+            if os.path.isabs(norm) or norm == "." or norm.split("/")[0] == "..":
+                sys.exit(f"fatal: --exclude takes paths inside the worktree, "
+                         f"got {item.strip()!r}")
+            out.append(norm)
+    return out
+
+
+def prune_tree(paths):
+    """Nest exclusion paths: {'target': None, 'sub': {'b': None}}.
+
+    None means "do not clone this at all"; a dict means "descend, this holds
+    something excluded". An ancestor excluded outright absorbs anything finer
+    beneath it, in either order.
+    """
+    root = {}
+    for path in paths:
+        parts = path.split("/")
+        node = root
+        for part in parts[:-1]:
+            if node.get(part, {}) is None:
+                break                       # already excluded whole, higher up
+            node = node.setdefault(part, {})
+        else:
+            node[parts[-1]] = None
+    return root
+
+
+def containing_dirs(paths):
+    """Every directory with one of paths beneath it: a/b/c.txt -> {a, a/b}."""
+    dirs = set()
+    for path in paths:
+        d = os.path.dirname(path)
+        while d and d not in dirs:
+            dirs.add(d)
+            d = os.path.dirname(d)
+    return dirs
+
+
+def ignored_dirs(src_wt):
+    """Directories `git clean -Xd` would remove, worktree-relative.
+
+    Whole directories only. They hold the bytes worth not cloning (target/,
+    node_modules/, .venv/), whereas enumerating every scattered *.pyc up front
+    costs more than cloning them and letting the clean pass take them afterwards.
+
+    `-o` reports untracked paths only, so a directory holding tracked files is
+    never collapsed into one entry here — git lists the individual ignored files
+    inside it instead. The caller re-checks that regardless: skipping a directory
+    with tracked content would leave the patched index describing files that are
+    not there.
+    """
+    out = git("ls-files", "-o", "-i", "--directory", "--exclude-standard", "-z",
+              cwd=src_wt, check=False)
+    return [p.rstrip("/") for p in nul_list(out) if p.endswith("/")]
+
+
+def excluded_paths(prune, base=""):
+    """Every path a prune tree excludes, relative to the tree it applies to."""
+    for name, sub in prune.items():
+        path = base + name
+        if sub is None:
+            yield path
+        else:
+            yield from excluded_paths(sub, path + "/")
+
+
+def only_files(src, prune):
+    """True if nothing the prune tree excludes under src is a real directory.
+
+    Which is the cheap case, and worth telling apart: clonefile(2) shares blocks,
+    so cloning a file and deleting it again costs nothing however large it is,
+    while descending to avoid it costs a clone call for every sibling it has. A
+    directory is the opposite — it can hold a whole node_modules, and that is
+    exactly what must not be cloned only to be removed.
+    """
+    for name, sub in prune.items():
+        path = os.path.join(src, name)
+        if sub is None:
+            if os.path.isdir(path) and not os.path.islink(path):
+                return False
+        elif not only_files(path, sub):
+            return False
+    return True
+
+
+def clone_tree(src, dst, prune, stats, root=False):
+    """clonefile every entry of src into dst, honouring the prune tree.
+
+    Names mapped to None are not cloned. A name mapped to a subtree holds
+    something excluded, and is handled whichever way is cheaper:
+
+      descend      recreate the directory and clone its keepers one by one, so
+                   the excluded directory is never cloned at all. Costs one call
+                   per sibling instead of one for the whole tree, which is the
+                   price of not paying for the excluded bytes twice.
+
+      clone whole  when only files are excluded beneath it: clone the directory
+                   in one call and unlink them afterwards. Deleting a file the
+                   kernel cloned by reference is free; enumerating its siblings
+                   is not.
+
+    Either way the fan-out cost is bounded by the excluded path's ancestors.
+    Everything off that path is still one clonefile(2) recursed by the kernel.
+    """
+    for name in os.listdir(src):
+        if root and name == ".git":
+            continue                        # ours was made by `worktree add`
+        s, d = os.path.join(src, name), os.path.join(dst, name)
+        sub = prune.get(name, KEEP)
+        if sub is None:
+            stats["excluded"] += 1
+            continue
+        # A prune subtree under something that is not a directory (or is a
+        # symlink to one) describes a path that cannot exist, so only_files sees
+        # no directory to avoid and the whole thing is cloned as it stands.
+        if sub is not KEEP and os.path.isdir(s) and not os.path.islink(s):
+            if not only_files(s, sub):
+                os.mkdir(d)
+                clone_tree(s, d, sub, stats)
+                # Mode is all there is to carry: clonefile(2) does not preserve
+                # directory mtimes either, so this matches the rest of the tree.
+                os.chmod(d, os.stat(s).st_mode & 0o7777)
+                continue
+            clonefile(s, d)
+            stats["cloned"] += 1
+            for rel in excluded_paths(sub):
+                try:
+                    os.unlink(os.path.join(d, rel))
+                    stats["excluded"] += 1
+                except (FileNotFoundError, NotADirectoryError):
+                    pass                    # excluded a path that isn't there
+            continue
+        clonefile(s, d)
+        stats["cloned"] += 1
+
+
+# --------------------------------------------------------------------------
 # worktree construction
 # --------------------------------------------------------------------------
 
@@ -278,6 +452,8 @@ def resolve_checkout(args, path):
 
 
 def fallback_argv(args, path):
+    # --exclude and --exclude-ignored need no translation: a plain checkout
+    # materialises tracked files only, so it carries nothing they would drop.
     argv = ["worktree", "add"]
     if args.b:
         argv += ["-b", args.b]
@@ -312,6 +488,12 @@ def main():
                         "in the new worktree instead of rewriting its index")
     p.add_argument("--clean", action="store_true",
                    help="drop untracked and ignored files after cloning")
+    p.add_argument("--exclude", metavar="PATHS", action="append",
+                   help="comma-separated paths not to carry over (repeatable); "
+                        "literal worktree-relative paths, not patterns")
+    p.add_argument("--exclude-ignored", dest="exclude_ignored",
+                   action="store_true",
+                   help="do not carry over gitignored files")
     p.add_argument("--dirty", action="store_true",
                    help="allow cloning a source worktree with local changes")
     p.add_argument("--no-clone", action="store_true",
@@ -319,6 +501,7 @@ def main():
     p.add_argument("-q", "--quiet", action="store_true")
     p.add_argument("-v", "--verbose", action="store_true", help="show timings")
     args = p.parse_args()
+    excludes = parse_excludes(args.exclude)
 
     def say(msg):
         if not args.quiet:
@@ -357,14 +540,36 @@ def main():
             # let git worktree add produce the authoritative diagnostic
             raise Unsupported(f"cannot resolve {requested!r}")
 
-        # Past ~half the tree changing, a plain checkout wins.
+        # Past ~half the tree changing, a plain checkout wins. -z keeps paths
+        # with unusual characters unquoted, since the exclusion checks below
+        # match against these same two lists.
         t = time.perf_counter()
-        changed = len(git("diff", "--name-only", src_head, target,
-                          cwd=src_wt).splitlines())
-        total = len(git("ls-files", cwd=src_wt).splitlines())
+        delta = nul_list(git("diff", "--name-only", "-z", src_head, target,
+                             cwd=src_wt))
+        listed = nul_list(git("ls-files", "-z", cwd=src_wt))
+        changed, total = len(delta), len(listed)
         timings["delta_probe"] = time.perf_counter() - t
         if total and changed / total > DELTA_FALLBACK_RATIO:
             raise Unsupported(f"{changed} files differ (source tree has {total})")
+
+        # Tracked at HEAD, or about to be created by the delta checkout.
+        tracked = set(listed) | set(delta)
+        parents = containing_dirs(tracked)
+        held = [p for p in excludes if p in tracked or p in parents]
+        if held:
+            # A hard error rather than a fallback: dropping tracked content would
+            # leave the index describing files that are not there, and falling
+            # back to `git worktree add` would silently keep the very paths the
+            # caller asked to exclude.
+            sys.exit("fatal: --exclude names tracked path(s): "
+                     + ", ".join(sorted(held)))
+
+        skip = list(excludes)
+        if args.exclude_ignored:
+            t = time.perf_counter()
+            skip += [d for d in ignored_dirs(src_wt) if d not in parents]
+            timings["ignored_probe"] = time.perf_counter() - t
+        prune = prune_tree(skip)
     except Unsupported as e:
         run_fallback(str(e))
     except (subprocess.CalledProcessError, OSError) as e:
@@ -378,9 +583,8 @@ def main():
         timings["worktree_add"] = time.perf_counter() - t
 
         t = time.perf_counter()
-        for name in os.listdir(src_wt):
-            if name != ".git":
-                clonefile(os.path.join(src_wt, name), os.path.join(dst, name))
+        stats = {"cloned": 0, "excluded": 0}
+        clone_tree(src_wt, dst, prune, stats, root=True)
         timings["clone_tree"] = time.perf_counter() - t
 
         admin = git("rev-parse", "--absolute-git-dir", cwd=dst)
@@ -442,6 +646,15 @@ def main():
         git(*argv, cwd=dst)
         timings["delta_checkout"] = time.perf_counter() - t
 
+        if args.exclude_ignored and not args.clean:
+            # Not cloning ignored directories is only an optimisation; this pass
+            # is what makes the flag exact, since the scattered ignored files
+            # (*.pyc, .DS_Store) were deliberately left to it. It cannot touch a
+            # tracked file, so the index stays true either way.
+            t = time.perf_counter()
+            git("clean", "-Xdff", cwd=dst)
+            timings["clean_ignored"] = time.perf_counter() - t
+
         if args.clean:
             t = time.perf_counter()
             git("clean", "-xdff", cwd=dst)
@@ -460,7 +673,8 @@ def main():
 
     head = git("rev-parse", "--short", "HEAD", cwd=dst)
     mode = "checkStat=minimal" if args.no_patch else "index patched"
-    say(f"wtclone: {dst} at {head} ({changed} files applied, {mode})")
+    dropped = f", {stats['excluded']} paths not cloned" if stats["excluded"] else ""
+    say(f"wtclone: {dst} at {head} ({changed} files applied{dropped}, {mode})")
     if args.verbose:
         for k, v in timings.items():
             say(f"  {k:<15} {v:.3f}s")

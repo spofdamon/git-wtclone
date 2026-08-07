@@ -31,13 +31,46 @@ git wtclone -b exp ../exp origin/main     # new branch from a start point
 git wtclone --detach ../poke HEAD~5
 git wtclone --no-patch ../feature-x       # leave .git untouched (see below)
 git wtclone --clean ../feature-x          # tracked files only
+git wtclone --exclude-ignored ../feature-x        # no gitignored files
+git wtclone --exclude .env,tmp/big ../feature-x   # leave these behind
 git wtclone -v ../feature-x               # per-step timings
 ```
 
 Untracked and ignored files (`target/`, `node_modules/`, `.venv/`) come along by
 default at zero disk cost — something git worktree can't do, since those files
-aren't in the object database. Use `--clean` to opt out. Note this also carries
-`.env` files and stale build artifacts.
+aren't in the object database. Note this also carries `.env` files and stale
+build artifacts.
+
+## Leaving things behind
+
+`--clean` drops everything untracked, as before. The two narrower options:
+
+- **`--exclude-ignored`** carries untracked files but not gitignored ones — a
+  fresh `target/`, but your uncommitted scratch files intact.
+- **`--exclude a,b,c`** names paths to leave behind. Comma-separated, repeatable,
+  relative to the worktree root. Literal paths, **not patterns**: routing them
+  through git pathspecs would have given globs for free but is quietly wrong,
+  since git collapses a wholly-untracked directory to the directory itself and
+  `*/node_modules` then matches nothing under one.
+
+Both work by not cloning, rather than by cloning and deleting. A directory
+holding an excluded path is recreated and its keepers cloned individually, so
+the excluded bytes are never paid for — once to clone, once to `rm`. That split
+costs one `clonefile(2)` per sibling instead of one for the whole directory, so
+it only happens where it pays: when only *files* are excluded beneath a
+directory, it clones the directory whole and unlinks them instead, since
+deleting a file the kernel cloned by reference is free.
+
+On a 20,000-entry directory: excluding a file in it costs 0.37 s against a
+0.45 s baseline, excluding a sub-directory 1.81 s. `--clean`, which clones
+everything first and then deletes 30,000 files, costs 1.48 s where
+`--exclude-ignored` costs 0.42 s.
+
+Excluding a **tracked** path is refused outright rather than falling back —
+dropping tracked content would leave the index describing files that aren't
+there, and `git worktree add` would silently keep the very paths you asked to
+exclude. Neither option needs translating for the fallback path anyway: a plain
+checkout materialises tracked files only, so it carries nothing they would drop.
 
 ## The two modes
 
@@ -127,8 +160,10 @@ index back with the same entry count or the original is restored. It never
 degrades to `--no-patch` on its own — that would relax `core.checkStat` without
 being asked.
 
-The tool never reports an error itself. It cleans up any partial worktree and
-hands off to git so git emits the authoritative diagnostic.
+The tool cleans up any partial worktree and hands off to git so git emits the
+authoritative diagnostic. The one thing it refuses on its own is `--exclude`
+naming a tracked path, where falling back would do the opposite of what was
+asked.
 
 ## Making it the default for Claude Code
 

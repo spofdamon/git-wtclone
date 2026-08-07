@@ -56,8 +56,17 @@ restoration.
 
 By default untracked and ignored files come along at no disk cost — this is the
 main win, since it skips a full rebuild in the new worktree. It also copies
-`.env` files and stale build output. Pass `--clean` for a tracked-files-only
-worktree.
+`.env` files and stale build output. To leave things behind:
+
+- **`--clean`** for a tracked-files-only worktree.
+- **`--exclude-ignored`** keeps untracked files but drops gitignored ones (a
+  fresh `target/`, scratch files intact).
+- **`--exclude a,b,c`** names paths to leave behind — comma-separated,
+  repeatable, worktree-relative. Literal paths, not globs. Excluding a tracked
+  path is refused outright, so pass only untracked ones.
+
+All three cost less than doing it afterwards: excluded paths are never cloned,
+so nothing is paid for twice. Prefer them over a `rm -rf` in the new worktree.
 
 ## If it is not installed
 
